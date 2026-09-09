@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- The `zstd` feature accepts `zstd` 0.14 as well as 0.13.
+
 ### Fixed
 
 - Improved decompression performance for non-solid 7z archives containing many files.
