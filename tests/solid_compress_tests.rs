@@ -164,3 +164,112 @@ fn prepare_block_refuses_mismatched_entries_and_readers() {
         "unexpected error: {err}"
     );
 }
+
+/// Bytes that look like x86 code: calls and jumps with near and far targets between plain bytes.
+#[cfg(feature = "compress")]
+fn x86_like_code() -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut x: u32 = 7;
+    for i in 0..60_000u32 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        match i % 19 {
+            0 => {
+                code.push(0xE8);
+                code.extend_from_slice(&(i.wrapping_mul(13) % 4000).to_le_bytes());
+            }
+            7 => {
+                code.push(0xE9);
+                code.extend_from_slice(&0xFFFF_FE00u32.to_le_bytes());
+            }
+            11 => {
+                code.push(0x0F);
+                code.push(0x85);
+                code.extend_from_slice(&(i % 100).to_le_bytes());
+            }
+            _ => code.push((x >> 16) as u8),
+        }
+    }
+    code
+}
+
+#[cfg(all(feature = "compress", feature = "util"))]
+fn bcj2_round_trip(password: Option<&str>) {
+    use std::io::Cursor;
+
+    let temp_dir = tempdir().unwrap();
+    let dest = temp_dir.path().join("bcj2.7z");
+    let code = x86_like_code();
+    let text = b"a text file in the same block\n".repeat(200);
+    let entries = vec![
+        ArchiveEntry::new_file("program.exe"),
+        ArchiveEntry::new_file("readme.txt"),
+    ];
+    let readers = vec![
+        SourceReader::new(Cursor::new(code.clone())),
+        SourceReader::new(Cursor::new(text.clone())),
+    ];
+    let mut addresses = encoder_options::LzmaOptions::from_level(5);
+    addresses.set_literal_bits(0, 2, 2);
+    addresses.set_dictionary_size(1 << 20);
+    let methods = Bcj2Methods {
+        main: EncoderConfiguration::new(EncoderMethod::LZMA2),
+        addresses: addresses.into(),
+        password: password.map(Password::new),
+    };
+    let block = prepare_bcj2_block(&methods, entries, readers).expect("prepare ok");
+    assert_eq!(block.len(), 2);
+    assert!(
+        block.compressed_len() < code.len() + text.len(),
+        "the block compresses"
+    );
+
+    let mut sz = ArchiveWriter::create(&dest).unwrap();
+    sz.push_prepared_block(block).expect("push ok");
+    sz.finish().expect("finish ok");
+
+    let out = temp_dir.path().join("out");
+    match password {
+        Some(password) => decompress_file_with_password(&dest, &out, Password::new(password))
+            .expect("decompress ok"),
+        None => decompress_file(&dest, &out).expect("decompress ok"),
+    }
+    assert_eq!(std::fs::read(out.join("program.exe")).unwrap(), code);
+    assert_eq!(std::fs::read(out.join("readme.txt")).unwrap(), text);
+
+    // The folder is a graph of four packed streams ending in BCJ2, laid out as 7-Zip lays
+    // its own out.
+    let archive = Archive::open_with_password(&dest, &Password::empty()).unwrap();
+    assert_eq!(archive.blocks.len(), 1);
+    let block = &archive.blocks[0];
+    let last = block.coders.last().unwrap();
+    assert_eq!(last.encoder_method_id(), EncoderMethod::ID_BCJ2);
+    assert_eq!(last.num_in_streams(), 4);
+    let (bind_pairs, packed_streams) = block.graph();
+    if password.is_some() {
+        assert_eq!(
+            bind_pairs,
+            [(4, 0), (5, 1), (10, 2), (6, 3), (9, 4), (8, 5), (7, 6)]
+        );
+        assert_eq!(packed_streams, [3, 2, 1, 0]);
+    } else {
+        assert_eq!(bind_pairs, [(5, 0), (4, 1), (3, 2)]);
+        assert_eq!(packed_streams, [2, 6, 1, 0]);
+    }
+    assert_eq!(
+        block.coders.len(),
+        if password.is_some() { 8 } else { 4 },
+        "AES on every stream when encrypted"
+    );
+}
+
+#[cfg(all(feature = "compress", feature = "util"))]
+#[test]
+fn a_bcj2_block_round_trips_as_a_folder_of_four_streams() {
+    bcj2_round_trip(None);
+}
+
+#[cfg(all(feature = "compress", feature = "util", feature = "aes256"))]
+#[test]
+fn a_bcj2_block_round_trips_encrypted_on_every_stream() {
+    bcj2_round_trip(Some("secret"));
+}

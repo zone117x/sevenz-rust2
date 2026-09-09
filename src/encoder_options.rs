@@ -28,6 +28,24 @@ impl LzmaOptions {
     pub fn from_level(level: u32) -> Self {
         Self(lzma_rust2::LzmaOptions::with_preset(level))
     }
+
+    /// Sets the literal context bits, literal position bits and position bits (`lc`, `lp`
+    /// and `pb`), as 7-Zip's `lc0 lp2` does for streams of 32-bit words.
+    ///
+    /// `lc + lp` is at most 4; each of `lp` and `pb` is at most 4.
+    pub fn set_literal_bits(&mut self, lc: u32, lp: u32, pb: u32) {
+        let lp = lp.min(4);
+        self.0.lc = lc.min(4 - lp);
+        self.0.lp = lp;
+        self.0.pb = pb.min(4);
+    }
+
+    /// Sets the dictionary size used when encoding.
+    ///
+    /// Will be clamped between 4096..=4294967280.
+    pub fn set_dictionary_size(&mut self, dict_size: u32) {
+        self.0.dict_size = dict_size.clamp(lzma_rust2::DICT_SIZE_MIN, lzma_rust2::DICT_SIZE_MAX);
+    }
 }
 
 #[cfg(feature = "compress")]
@@ -449,6 +467,13 @@ impl From<DeltaOptions> for EncoderConfiguration {
 impl From<Lzma2Options> for EncoderConfiguration {
     fn from(options: Lzma2Options) -> Self {
         Self::new(crate::EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(options))
+    }
+}
+
+#[cfg(feature = "compress")]
+impl From<LzmaOptions> for EncoderConfiguration {
+    fn from(options: LzmaOptions) -> Self {
+        Self::new(crate::EncoderMethod::LZMA).with_options(EncoderOptions::Lzma(options))
     }
 }
 

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `prepare_bcj2_block` compresses a solid block behind the BCJ2 filter, as 7-Zip's
+  `-mf=BCJ2` does for x86 executables: an encoder of this crate's own splits the code into
+  the main, call, jump and decision streams, the first three are compressed with the
+  `Bcj2Methods` given, and the folder is written as 7-Zip lays it out (four packed streams,
+  eight coders with AES on every stream when a password is set). 7-Zip reads the result.
+- `LzmaOptions::set_literal_bits` sets `lc`, `lp` and `pb` (7-Zip's `lc0 lp2` for streams of
+  addresses), `LzmaOptions::set_dictionary_size` the dictionary, and `EncoderConfiguration`
+  can be built from `LzmaOptions` with `into()`.
+- `Coder::num_in_streams` and `Block::graph` expose how a folder's coders are wired.
+
 ### Fixed
 
 - Improved decompression performance for non-solid 7z archives containing many files.

@@ -19,6 +19,18 @@ pub struct Block {
 }
 
 impl Block {
+    /// The bind pairs as (input stream, output stream) and the input streams fed by packed
+    /// streams, in header order: how the coders are wired.
+    pub fn graph(&self) -> (Vec<(u64, u64)>, Vec<u64>) {
+        (
+            self.bind_pairs
+                .iter()
+                .map(|bp| (bp.in_index, bp.out_index))
+                .collect(),
+            self.packed_streams.clone(),
+        )
+    }
+
     pub(crate) fn find_bind_pair_for_in_stream(&self, index: u64) -> Option<&BindPair> {
         self.bind_pairs.iter().find(|bp| bp.in_index == index)
     }
@@ -97,6 +109,11 @@ impl Coder {
     /// [`encoder_method_id`](Self::encoder_method_id).
     pub fn properties(&self) -> &[u8] {
         &self.properties
+    }
+
+    /// Returns how many streams feed this coder: one for a compressor or a filter, four for BCJ2.
+    pub fn num_in_streams(&self) -> u64 {
+        self.num_in_streams
     }
 
     pub(crate) fn decompression_method_id_mut(&mut self) -> &mut [u8] {
