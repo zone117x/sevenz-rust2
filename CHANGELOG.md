@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `deflate64` feature decodes the Deflate64 method (id `04 01 09`), which 7-Zip writes with
   `-m0=Deflate64`, through the `deflate64` crate.
 
+### Changed
+
+- The `zstd` feature accepts `zstd` 0.14 as well as 0.13.
+
 ### Fixed
 
 - PPMd streams were written with five extra bytes at the end (the range coder was flushed by
