@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Lzma2Options::set_dictionary_size` does.
 - `EncoderConfiguration` can be built from `LzmaOptions` with `into()`, as it can from the other
   option types.
+- The `deflate64` feature decodes the Deflate64 method (id `04 01 09`), which 7-Zip writes with
+  `-m0=Deflate64`, through the `deflate64` crate.
 
 ### Fixed
 
