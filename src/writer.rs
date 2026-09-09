@@ -22,12 +22,17 @@ use crc32fast::Hasher;
 pub(crate) use self::lazy_file_reader::LazyFileReader;
 pub(crate) use self::seq_reader::SeqReader;
 pub use self::source_reader::SourceReader;
-use self::{pack_info::PackInfo, unpack_info::UnpackInfo};
+use self::{
+    pack_info::PackInfo,
+    unpack_info::{Folder, GraphCoder, UnpackInfo},
+};
+#[cfg(feature = "aes256")]
+use crate::encoder_options::AesEncoderOptions;
 use crate::{
-    ArchiveEntry, AutoFinish, AutoFinisher, ByteWriter, Error,
+    ArchiveEntry, AutoFinish, AutoFinisher, ByteWriter, Error, Password,
     archive::*,
     bitset::{BitSet, write_bit_set},
-    encoder,
+    codec, encoder,
 };
 
 macro_rules! write_times {
@@ -247,24 +252,24 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         }
 
         let PreparedBlock {
-            compressed,
-            compressed_crc,
+            packed,
             entries,
-            methods,
+            folder,
             sizes,
             crc,
             sub_stream_sizes,
             sub_stream_crcs,
         } = block;
 
-        let compressed_len = compressed.len() as u64;
-        self.output
-            .write_all(&compressed)
-            .map_err(|e| Error::io_msg(e, "push_prepared_block: write".to_string()))?;
-
-        self.pack_info.add_stream(compressed_len, compressed_crc);
+        for (compressed, compressed_crc) in packed {
+            self.output
+                .write_all(&compressed)
+                .map_err(|e| Error::io_msg(e, "push_prepared_block: write".to_string()))?;
+            self.pack_info
+                .add_stream(compressed.len() as u64, compressed_crc);
+        }
         self.unpack_info.add_multiple(
-            methods,
+            folder,
             sizes,
             crc,
             entries.len() as u64,
@@ -354,7 +359,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         sizes.push(size as u64);
 
         self.unpack_info.add_multiple(
-            content_methods.clone(),
+            Folder::Chain(content_methods.clone()),
             sizes,
             crc,
             entries.len() as u64,
@@ -713,10 +718,10 @@ impl<W: Write> Write for CompressWrapWriter<'_, W> {
 /// peak memory is roughly the compressed size of every block in flight at once.
 #[derive(Debug)]
 pub struct PreparedBlock {
-    compressed: Vec<u8>,
-    compressed_crc: u32,
+    /// The packed streams with their CRCs: one for a chain of coders, four for BCJ2.
+    packed: Vec<(Vec<u8>, u32)>,
     entries: Vec<ArchiveEntry>,
-    methods: Arc<Vec<EncoderConfiguration>>,
+    folder: Folder,
     sizes: Vec<u64>,
     crc: u32,
     sub_stream_sizes: Vec<u64>,
@@ -726,7 +731,7 @@ pub struct PreparedBlock {
 impl PreparedBlock {
     /// Compressed size in bytes, before it is appended.
     pub fn compressed_len(&self) -> usize {
-        self.compressed.len()
+        self.packed.iter().map(|(bytes, _)| bytes.len()).sum()
     }
 
     /// Number of entries in the block.
@@ -835,10 +840,299 @@ pub fn prepare_block<R: Read>(
     sizes.push(size as u64);
 
     Ok(PreparedBlock {
-        compressed: out,
-        compressed_crc,
+        packed: vec![(out, compressed_crc)],
         entries,
-        methods,
+        folder: Folder::Chain(methods),
+        sizes,
+        crc,
+        sub_stream_sizes,
+        sub_stream_crcs,
+    })
+}
+
+/// How a BCJ2 block's four streams are compressed: the coder for the main stream (what the
+/// files mostly are), the coder for the call and jump streams (32-bit addresses, which 7-Zip
+/// gives LZMA with `lc0 lp2` and a 1 MiB dictionary), and AES around every stream when a
+/// password is given.
+#[derive(Debug, Clone)]
+pub struct Bcj2Methods {
+    /// The coder for the main stream: the code with its branch operands taken out.
+    pub main: EncoderConfiguration,
+    /// The coder for the call and jump streams: big-endian 32-bit addresses.
+    pub addresses: EncoderConfiguration,
+    /// AES-256 around every stream, when set.
+    pub password: Option<Password>,
+}
+
+/// Compress `entries` into one solid block behind the BCJ2 filter, as 7-Zip's `-mf=BCJ2`
+/// does for x86 executables: the code split into a main stream, a call stream, a jump stream
+/// and the range-coded decisions, the first three compressed with `methods`, and the folder
+/// written as a graph of four packed streams (eight coders when encrypted, AES on each).
+///
+/// Like [`prepare_block`], safe on a worker thread; the result is appended with
+/// [`ArchiveWriter::push_prepared_block`].
+pub fn prepare_bcj2_block<R: Read>(
+    methods: &Bcj2Methods,
+    entries: Vec<ArchiveEntry>,
+    reader: Vec<SourceReader<R>>,
+) -> Result<PreparedBlock> {
+    let mut entries = entries;
+    let mut r = SeqReader::new(reader);
+    if r.reader_len() != entries.len() {
+        return Err(Error::other(format!(
+            "prepare_bcj2_block: {} entries against {} readers",
+            entries.len(),
+            r.reader_len()
+        )));
+    }
+    // One compressed stream, its CRC, the bytes fed into its coders (the last is the
+    // plain size), and the AES configuration when there is one.
+    struct Stream {
+        packed: Vec<u8>,
+        packed_crc: u32,
+        sizes: Vec<u64>,
+        aes: Option<EncoderConfiguration>,
+    }
+    fn compress(
+        chain: Vec<EncoderConfiguration>,
+        aes: Option<EncoderConfiguration>,
+        feed: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<Stream> {
+        let mut methods: Vec<EncoderConfiguration> = Vec::with_capacity(chain.len() + 1);
+        methods.extend(aes.iter().cloned());
+        methods.extend(chain);
+        let mut out: Vec<u8> = Vec::new();
+        let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::new();
+        let mut compressed_len = 0;
+        let (packed_crc, size) = {
+            let mut compressed = CompressWrapWriter::new(&mut out, &mut compressed_len);
+            let size = if methods.is_empty() {
+                let mut plain = 0;
+                let mut w = CompressWrapWriter::new(&mut compressed, &mut plain);
+                feed(&mut w)?;
+                w.flush()
+                    .map_err(|e| Error::io_msg(e, "prepare_bcj2_block: flush".to_string()))?;
+                plain
+            } else {
+                let mut w = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
+                    &methods,
+                    &mut compressed,
+                    &mut more_sizes,
+                )?;
+                let mut plain = 0;
+                let mut w = CompressWrapWriter::new(&mut w, &mut plain);
+                feed(&mut w)?;
+                w.flush()
+                    .map_err(|e| Error::io_msg(e, "prepare_bcj2_block: flush".to_string()))?;
+                w.write(&[])
+                    .map_err(|e| Error::io_msg(e, "prepare_bcj2_block: finish".to_string()))?;
+                plain
+            };
+            (compressed.crc_value(), size)
+        };
+        let mut sizes: Vec<u64> = more_sizes.iter().map(|s| s.get() as u64).collect();
+        sizes.push(size as u64);
+        Ok(Stream {
+            packed: out,
+            packed_crc,
+            sizes,
+            aes,
+        })
+    }
+    #[cfg(feature = "aes256")]
+    let aes = |password: &Option<Password>| -> Option<EncoderConfiguration> {
+        password
+            .as_ref()
+            .map(|p| AesEncoderOptions::new(p.clone()).into())
+    };
+    #[cfg(not(feature = "aes256"))]
+    let aes = |password: &Option<Password>| -> Option<EncoderConfiguration> {
+        let _ = password;
+        None
+    };
+    #[cfg(not(feature = "aes256"))]
+    if methods.password.is_some() {
+        return Err(Error::unsupported(
+            "prepare_bcj2_block: a password needs the aes256 feature",
+        ));
+    }
+
+    // The filter runs once over the input, feeding three encoders; the fourth stream is what
+    // it keeps. Each encoder is driven through a buffer so the four can be built in turn.
+    let mut main_plain: Vec<u8> = Vec::new();
+    let mut call_plain: Vec<u8> = Vec::new();
+    let mut jump_plain: Vec<u8> = Vec::new();
+    let (crc, size, rc) = {
+        let mut encoder = codec::bcj2::Bcj2Encoder::new();
+        let mut hasher = Hasher::new();
+        let mut size = 0u64;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = r.read(&mut buf).map_err(|e| {
+                Error::io_msg(
+                    e,
+                    format!(
+                        "prepare_bcj2_block: read source:{}",
+                        entries_names(&entries)
+                    ),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            size += n as u64;
+            let mut streams = codec::bcj2::Bcj2Streams {
+                main: &mut main_plain,
+                call: &mut call_plain,
+                jump: &mut jump_plain,
+            };
+            encoder.write(&buf[..n], &mut streams).map_err(|e| {
+                Error::io_msg(
+                    e,
+                    format!("prepare_bcj2_block: filter:{}", entries_names(&entries)),
+                )
+            })?;
+        }
+        let mut streams = codec::bcj2::Bcj2Streams {
+            main: &mut main_plain,
+            call: &mut call_plain,
+            jump: &mut jump_plain,
+        };
+        let rc = encoder.finish(&mut streams).map_err(|e| {
+            Error::io_msg(
+                e,
+                format!("prepare_bcj2_block: filter:{}", entries_names(&entries)),
+            )
+        })?;
+        (hasher.finalize(), size, rc)
+    };
+    let feed_all = |bytes: Vec<u8>| {
+        move |w: &mut dyn Write| -> Result<()> {
+            w.write_all(&bytes)
+                .map_err(|e| Error::io_msg(e, "prepare_bcj2_block: encode".to_string()))
+        }
+    };
+    let main = compress(
+        vec![methods.main.clone()],
+        aes(&methods.password),
+        feed_all(main_plain),
+    )?;
+    let call = compress(
+        vec![methods.addresses.clone()],
+        aes(&methods.password),
+        feed_all(call_plain),
+    )?;
+    let jump = compress(
+        vec![methods.addresses.clone()],
+        aes(&methods.password),
+        feed_all(jump_plain),
+    )?;
+    let decisions = compress(Vec::new(), aes(&methods.password), feed_all(rc))?;
+
+    // The folder, laid out as 7-Zip lays it out: the coders for the jump, call and main
+    // streams, then BCJ2 with its four inputs (main, call, jump, decisions), and before them
+    // an AES coder per stream when encrypting; the packed streams in the order main,
+    // decisions, call, jump. Streams are numbered in coder order.
+    let coder_of = |configuration: &EncoderConfiguration| -> GraphCoder {
+        let mut temp = [0u8; 256];
+        let properties = encoder::get_options_as_properties(
+            configuration.method,
+            configuration.options.as_ref(),
+            &mut temp,
+        )
+        .to_vec();
+        GraphCoder {
+            id: configuration.method.id(),
+            properties,
+            num_in_streams: 1,
+        }
+    };
+    let bcj2 = GraphCoder {
+        id: EncoderMethod::ID_BCJ2,
+        properties: Vec::new(),
+        num_in_streams: 4,
+    };
+    let plain_size = |stream: &Stream| stream.sizes[stream.sizes.len() - 1];
+    let (coders, sizes, bind_pairs, packed_streams) = if methods.password.is_some() {
+        let aes_of = |stream: &Stream| -> Result<GraphCoder> {
+            let configuration = stream
+                .aes
+                .as_ref()
+                .ok_or_else(|| Error::other("prepare_bcj2_block: a stream without its AES"))?;
+            Ok(coder_of(configuration))
+        };
+        (
+            vec![
+                aes_of(&jump)?,
+                aes_of(&call)?,
+                aes_of(&decisions)?,
+                aes_of(&main)?,
+                coder_of(&methods.addresses),
+                coder_of(&methods.addresses),
+                coder_of(&methods.main),
+                bcj2,
+            ],
+            // What each coder unpacks to: AES to the packed bytes it hides, the
+            // compressors to their streams, BCJ2 to the whole.
+            vec![
+                jump.sizes[0],
+                call.sizes[0],
+                decisions.sizes[0],
+                main.sizes[0],
+                plain_size(&jump),
+                plain_size(&call),
+                plain_size(&main),
+                size,
+            ],
+            vec![(4, 0), (5, 1), (10, 2), (6, 3), (9, 4), (8, 5), (7, 6)],
+            vec![3, 2, 1, 0],
+        )
+    } else {
+        (
+            vec![
+                coder_of(&methods.addresses),
+                coder_of(&methods.addresses),
+                coder_of(&methods.main),
+                bcj2,
+            ],
+            vec![
+                plain_size(&jump),
+                plain_size(&call),
+                plain_size(&main),
+                size,
+            ],
+            vec![(5, 0), (4, 1), (3, 2)],
+            vec![2, 6, 1, 0],
+        )
+    };
+    let packed = vec![
+        (main.packed, main.packed_crc),
+        (decisions.packed, decisions.packed_crc),
+        (call.packed, call.packed_crc),
+        (jump.packed, jump.packed_crc),
+    ];
+
+    let mut sub_stream_crcs = Vec::with_capacity(entries.len());
+    let mut sub_stream_sizes = Vec::with_capacity(entries.len());
+    for i in 0..entries.len() {
+        let entry = &mut entries[i];
+        let ri = &r[i];
+        entry.crc = ri.crc_value() as u64;
+        entry.size = ri.read_count() as u64;
+        sub_stream_crcs.push(entry.crc as u32);
+        sub_stream_sizes.push(entry.size);
+        entry.has_crc = true;
+    }
+
+    Ok(PreparedBlock {
+        packed,
+        entries,
+        folder: Folder::Graph {
+            coders,
+            bind_pairs,
+            packed_streams,
+        },
         sizes,
         crc,
         sub_stream_sizes,

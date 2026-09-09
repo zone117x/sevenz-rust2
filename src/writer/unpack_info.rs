@@ -15,7 +15,7 @@ impl UnpackInfo {
         crc: u32,
     ) {
         self.blocks.push(BlockInfo {
-            methods,
+            folder: Folder::Chain(methods),
             sizes,
             crc,
             num_sub_unpack_streams: 1,
@@ -25,7 +25,7 @@ impl UnpackInfo {
 
     pub(crate) fn add_multiple(
         &mut self,
-        methods: Arc<Vec<EncoderConfiguration>>,
+        folder: Folder,
         sizes: Vec<u64>,
         crc: u32,
         num_sub_unpack_streams: u64,
@@ -33,7 +33,7 @@ impl UnpackInfo {
         sub_stream_crcs: Vec<u32>,
     ) {
         self.blocks.push(BlockInfo {
-            methods,
+            folder,
             sizes,
             crc,
             num_sub_unpack_streams,
@@ -128,9 +128,38 @@ impl UnpackInfo {
     }
 }
 
+/// One coder of a folder that is a graph rather than a chain: its method id and properties,
+/// and the number of streams it takes (four for BCJ2, one for everything else).
+#[derive(Debug, Clone)]
+pub(crate) struct GraphCoder {
+    pub(crate) id: &'static [u8],
+    pub(crate) properties: Vec<u8>,
+    pub(crate) num_in_streams: u64,
+}
+
+/// How a folder's coders are wired: a chain, where each coder feeds the next and one packed
+/// stream enters at the first, or a graph with its bind pairs and packed streams spelled out.
+#[derive(Debug, Clone)]
+pub(crate) enum Folder {
+    Chain(Arc<Vec<EncoderConfiguration>>),
+    Graph {
+        coders: Vec<GraphCoder>,
+        /// (input stream index, output stream index) pairs.
+        bind_pairs: Vec<(u64, u64)>,
+        /// The input stream indices fed by packed streams, in the order the streams are written.
+        packed_streams: Vec<u64>,
+    },
+}
+
+impl Default for Folder {
+    fn default() -> Self {
+        Self::Chain(Arc::new(Vec::new()))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BlockInfo {
-    pub(crate) methods: Arc<Vec<EncoderConfiguration>>,
+    pub(crate) folder: Folder,
     pub(crate) sizes: Vec<u64>,
     pub(crate) crc: u32,
     pub(crate) num_sub_unpack_streams: u64,
@@ -145,25 +174,60 @@ impl BlockInfo {
         cache: &mut Vec<u8>,
     ) -> std::io::Result<()> {
         cache.clear();
-        let mut num_coders = 0;
-        for mc in self.methods.iter() {
-            num_coders += 1;
-            self.write_single_codec(mc, cache)?;
-        }
-        write_u64(header, num_coders as u64)?;
-        header.write_all(cache)?;
-        for i in 0..num_coders - 1 {
-            write_u64(header, i as u64 + 1)?;
-            write_u64(header, i as u64)?;
+        match &self.folder {
+            Folder::Chain(methods) => {
+                let mut num_coders = 0;
+                for mc in methods.iter() {
+                    num_coders += 1;
+                    Self::write_single_codec(mc, cache)?;
+                }
+                write_u64(header, num_coders as u64)?;
+                header.write_all(cache)?;
+                for i in 0..num_coders - 1 {
+                    write_u64(header, i as u64 + 1)?;
+                    write_u64(header, i as u64)?;
+                }
+            }
+            Folder::Graph {
+                coders,
+                bind_pairs,
+                packed_streams,
+            } => {
+                write_u64(header, coders.len() as u64)?;
+                for coder in coders {
+                    let mut flags = coder.id.len() as u8;
+                    if coder.num_in_streams != 1 {
+                        flags |= 0x10;
+                    }
+                    if !coder.properties.is_empty() {
+                        flags |= 0x20;
+                    }
+                    header.write_u8(flags)?;
+                    header.write_all(coder.id)?;
+                    if coder.num_in_streams != 1 {
+                        write_u64(header, coder.num_in_streams)?;
+                        write_u64(header, 1)?;
+                    }
+                    if !coder.properties.is_empty() {
+                        write_u64(header, coder.properties.len() as u64)?;
+                        header.write_all(&coder.properties)?;
+                    }
+                }
+                for (in_index, out_index) in bind_pairs {
+                    write_u64(header, *in_index)?;
+                    write_u64(header, *out_index)?;
+                }
+                if packed_streams.len() > 1 {
+                    for index in packed_streams {
+                        write_u64(header, *index)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
 
-    fn write_single_codec<H: Write>(
-        &self,
-        mc: &EncoderConfiguration,
-        out: &mut H,
-    ) -> std::io::Result<()> {
+    fn write_single_codec<H: Write>(mc: &EncoderConfiguration, out: &mut H) -> std::io::Result<()> {
         let id = mc.method.id();
         let mut temp = [0u8; 256];
         let props = encoder::get_options_as_properties(mc.method, mc.options.as_ref(), &mut temp);

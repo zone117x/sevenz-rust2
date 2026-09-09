@@ -29,6 +29,17 @@ impl LzmaOptions {
         Self(lzma_rust2::LzmaOptions::with_preset(level))
     }
 
+    /// Sets the literal context bits, literal position bits and position bits (`lc`, `lp`
+    /// and `pb`), as 7-Zip's `lc0 lp2` does for streams of 32-bit words.
+    ///
+    /// `lc + lp` is at most 4; each of `lp` and `pb` is at most 4.
+    pub fn set_literal_bits(&mut self, lc: u32, lp: u32, pb: u32) {
+        let lp = lp.min(4);
+        self.0.lc = lc.min(4 - lp);
+        self.0.lp = lp;
+        self.0.pb = pb.min(4);
+    }
+
     /// Sets the dictionary size used when encoding.
     ///
     /// Will be clamped between 4096..=4294967280.

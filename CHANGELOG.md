@@ -10,12 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `LzmaOptions::set_nice_len` and `Lzma2Options::set_nice_len` set the nice length of a match
-  (7-Zip's word size), and `LzmaOptions::set_dictionary_size` sets the dictionary size as
-  `Lzma2Options::set_dictionary_size` does.
+  (7-Zip's word size), `LzmaOptions::set_dictionary_size` sets the dictionary size as
+  `Lzma2Options::set_dictionary_size` does, and `LzmaOptions::set_literal_bits` sets `lc`, `lp`
+  and `pb` (7-Zip's `lc0 lp2` for streams of addresses).
 - `EncoderConfiguration` can be built from `LzmaOptions` with `into()`, as it can from the other
   option types.
 - The `deflate64` feature decodes the Deflate64 method (id `04 01 09`), which 7-Zip writes with
   `-m0=Deflate64`, through the `deflate64` crate.
+- `prepare_bcj2_block` compresses a solid block behind the BCJ2 filter, as 7-Zip's
+  `-mf=BCJ2` does for x86 executables: an encoder of this crate's own splits the code into
+  the main, call, jump and decision streams, the first three are compressed with the
+  `Bcj2Methods` given, and the folder is written as 7-Zip lays it out (four packed streams,
+  eight coders with AES on every stream when a password is set). 7-Zip reads the result.
+- `Coder::num_in_streams` and `Block::graph` expose how a folder's coders are wired.
 
 ### Changed
 
