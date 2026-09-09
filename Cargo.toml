@@ -23,6 +23,7 @@ brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 compress = ["lzma-rust2/encoder"]
 deflate = ["dep:flate2"]
+deflate64 = ["dep:deflate64"]
 lz4 = ["dep:lz4_flex"]
 ppmd = ["dep:ppmd-rust"]
 util = []
@@ -35,6 +36,7 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 crc32fast = "1"
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
+deflate64 = { version = "0.1", optional = true }
 getrandom = { version = "0.4", optional = true }
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "optimization"] }
 ppmd-rust = { version = "1", optional = true }

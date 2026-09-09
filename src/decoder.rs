@@ -2,6 +2,8 @@ use std::{io, io::Read};
 
 #[cfg(feature = "bzip2")]
 use bzip2::read::BzDecoder;
+#[cfg(feature = "deflate64")]
+use deflate64::Deflate64Decoder;
 #[cfg(feature = "deflate")]
 use flate2::bufread::DeflateDecoder;
 use lzma_rust2::{
@@ -37,6 +39,8 @@ pub enum Decoder<R: Read> {
     Bzip2(BzDecoder<R>),
     #[cfg(feature = "deflate")]
     Deflate(DeflateDecoder<std::io::BufReader<R>>),
+    #[cfg(feature = "deflate64")]
+    Deflate64(Deflate64Decoder<std::io::BufReader<R>>),
     #[cfg(feature = "lz4")]
     Lz4(Lz4Decoder<R>),
     #[cfg(feature = "zstd")]
@@ -62,6 +66,8 @@ impl<R: Read> Read for Decoder<R> {
             Decoder::Bzip2(r) => r.read(buf),
             #[cfg(feature = "deflate")]
             Decoder::Deflate(r) => r.read(buf),
+            #[cfg(feature = "deflate64")]
+            Decoder::Deflate64(r) => r.read(buf),
             #[cfg(feature = "lz4")]
             Decoder::Lz4(r) => r.read(buf),
             #[cfg(feature = "zstd")]
@@ -144,6 +150,12 @@ pub fn add_decoder<I: Read>(
             let buf_read = std::io::BufReader::new(input);
             let de = DeflateDecoder::new(buf_read);
             Ok(Decoder::Deflate(de))
+        }
+        #[cfg(feature = "deflate64")]
+        EncoderMethod::ID_DEFLATE64 => {
+            let buf_read = std::io::BufReader::new(input);
+            let de = Deflate64Decoder::with_buffer(buf_read);
+            Ok(Decoder::Deflate64(de))
         }
         #[cfg(feature = "lz4")]
         EncoderMethod::ID_LZ4 => {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- The `deflate64` feature decodes the Deflate64 method (id `04 01 09`), which 7-Zip writes with
+  `-m0=Deflate64`, through the `deflate64` crate.
+
 ### Fixed
 
 - Improved decompression performance for non-solid 7z archives containing many files.
