@@ -71,6 +71,44 @@ impl Archive {
     pub fn pack_sizes(&self) -> &[u64] {
         &self.pack_sizes
     }
+
+    /// Where a block's packed streams lie in the file: the offset of the first one from the
+    /// start of the file, and their sizes in header order. They are stored back to back, so
+    /// the block's packed bytes are one contiguous range of the sizes' sum. `None` for a block
+    /// index the archive does not have.
+    pub fn block_packed_streams(&self, block_index: usize) -> Option<(u64, &[u64])> {
+        let block = self.blocks.get(block_index)?;
+        let first = *self
+            .stream_map
+            .block_first_pack_stream_index
+            .get(block_index)?;
+        let count = block.packed_streams.len().max(1);
+        let sizes = self.pack_sizes.get(first..first + count)?;
+        let offset = SIGNATURE_HEADER_SIZE
+            .checked_add(self.pack_pos)?
+            .checked_add(*self.stream_map.pack_stream_offsets.get(first)?)?;
+        Some((offset, sizes))
+    }
+
+    /// The files a block holds, in order: the indices into [`files`](Self::files) of the
+    /// entries with a stream that decode from this block.
+    pub fn block_files(&self, block_index: usize) -> Vec<usize> {
+        let Some(&first) = self.stream_map.block_first_file_index.get(block_index) else {
+            return Vec::new();
+        };
+        let Some(block) = self.blocks.get(block_index) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(block.num_unpack_sub_streams);
+        let mut i = first;
+        while out.len() < block.num_unpack_sub_streams && i < self.files.len() {
+            if self.files[i].has_stream {
+                out.push(i);
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 #[derive(Debug, Default, Clone)]

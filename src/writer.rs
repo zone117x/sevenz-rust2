@@ -29,7 +29,7 @@ use self::{
 #[cfg(feature = "aes256")]
 use crate::encoder_options::AesEncoderOptions;
 use crate::{
-    ArchiveEntry, AutoFinish, AutoFinisher, ByteWriter, Error, Password,
+    ArchiveEntry, AutoFinish, AutoFinisher, Block, ByteWriter, Error, Password,
     archive::*,
     bitset::{BitSet, write_bit_set},
     codec, encoder,
@@ -271,6 +271,102 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.unpack_info.add_multiple(
             folder,
             sizes,
+            crc,
+            entries.len() as u64,
+            sub_stream_sizes,
+            sub_stream_crcs,
+        );
+        self.files.extend(entries);
+        Ok(self)
+    }
+
+    /// Appends a block copied from another archive as it is: its packed bytes go into the
+    /// output unchanged, and the header describes its coders, their properties and their
+    /// wiring exactly as `block` did in the source. Nothing is decoded, so an encrypted block
+    /// is copied without its password, and a block in a method this crate cannot decode is
+    /// copied all the same.
+    ///
+    /// `packed` yields the block's packed streams back to back, in the order the source header
+    /// lists them, `pack_sizes` bytes in all (see [`Archive::block_packed_streams`]); their CRCs
+    /// are computed on the way. `entries` are the block's files with a stream, in order, each
+    /// with its `size` and `crc` (every file needs one: the sub-stream CRCs are written for
+    /// all). The block's own unpack sizes come from `block`.
+    pub fn push_raw_block<R: Read>(
+        &mut self,
+        block: &Block,
+        pack_sizes: &[u64],
+        packed: &mut R,
+        entries: Vec<ArchiveEntry>,
+    ) -> Result<&mut Self> {
+        if entries.is_empty() {
+            return Ok(self);
+        }
+        if entries.len() != block.num_unpack_sub_streams {
+            return Err(Error::other(format!(
+                "push_raw_block: {} entries for a block of {} streams",
+                entries.len(),
+                block.num_unpack_sub_streams
+            )));
+        }
+        let expected = block.packed_streams.len().max(1);
+        if pack_sizes.len() != expected {
+            return Err(Error::other(format!(
+                "push_raw_block: {} pack sizes for a block with {expected} packed streams",
+                pack_sizes.len()
+            )));
+        }
+        if let Some(entry) = entries.iter().find(|e| !e.has_crc) {
+            return Err(Error::other(format!(
+                "push_raw_block: {} has no CRC; the block cannot be copied",
+                entry.name
+            )));
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        for &size in pack_sizes {
+            let mut left = size;
+            let mut hasher = crc32fast::Hasher::new();
+            while left > 0 {
+                let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+                let n = packed
+                    .read(&mut buf[..want])
+                    .map_err(|e| Error::io_msg(e, "push_raw_block: read".to_string()))?;
+                if n == 0 {
+                    return Err(Error::other(
+                        "push_raw_block: the packed bytes end before their size",
+                    ));
+                }
+                hasher.update(&buf[..n]);
+                self.output
+                    .write_all(&buf[..n])
+                    .map_err(|e| Error::io_msg(e, "push_raw_block: write".to_string()))?;
+                left -= n as u64;
+            }
+            self.pack_info.add_stream(size, hasher.finalize());
+        }
+        let coders: Vec<GraphCoder> = block
+            .coders
+            .iter()
+            .map(|coder| GraphCoder {
+                id: coder.encoder_method_id().to_vec(),
+                properties: coder.properties().to_vec(),
+                num_in_streams: coder.num_in_streams(),
+            })
+            .collect();
+        let (bind_pairs, packed_streams) = block.graph();
+        let folder = Folder::Graph {
+            coders,
+            bind_pairs,
+            packed_streams,
+        };
+        let crc = u32::try_from(block.crc).unwrap_or(0);
+        let sub_stream_sizes: Vec<u64> = entries.iter().map(|e| e.size).collect();
+        let sub_stream_crcs: Vec<u32> = entries
+            .iter()
+            .map(|e| u32::try_from(e.crc).unwrap_or(0))
+            .collect();
+        self.unpack_info.add_multiple(
+            folder,
+            block.unpack_sizes.clone(),
             crc,
             entries.len() as u64,
             sub_stream_sizes,
@@ -1043,13 +1139,13 @@ pub fn prepare_bcj2_block<R: Read>(
         )
         .to_vec();
         GraphCoder {
-            id: configuration.method.id(),
+            id: configuration.method.id().to_vec(),
             properties,
             num_in_streams: 1,
         }
     };
     let bcj2 = GraphCoder {
-        id: EncoderMethod::ID_BCJ2,
+        id: EncoderMethod::ID_BCJ2.to_vec(),
         properties: Vec::new(),
         num_in_streams: 4,
     };

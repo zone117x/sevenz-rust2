@@ -273,3 +273,123 @@ fn a_bcj2_block_round_trips_as_a_folder_of_four_streams() {
 fn a_bcj2_block_round_trips_encrypted_on_every_stream() {
     bcj2_round_trip(Some("secret"));
 }
+
+/// Copies every block of `source` into a new archive through `push_raw_block`, with one more
+/// file compressed afresh after them, and reads everything back.
+#[cfg(all(feature = "compress", feature = "aes256"))]
+fn raw_block_copy(password: Option<&str>) {
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    use sevenz_rust2::encoder_options::AesEncoderOptions;
+
+    let temp_dir = tempdir().unwrap();
+    let source = temp_dir.path().join("source.7z");
+    let contents: Vec<Vec<u8>> = (0..6u8)
+        .map(|i| {
+            (0..2000u32)
+                .map(|j| (j as u8).wrapping_mul(i + 1))
+                .collect()
+        })
+        .collect();
+    {
+        let mut sz = ArchiveWriter::create(&source).unwrap();
+        let mut methods = vec![EncoderConfiguration::new(EncoderMethod::LZMA2)];
+        if let Some(password) = password {
+            methods.push(AesEncoderOptions::new(Password::new(password)).into());
+        }
+        sz.set_content_methods(methods);
+        // The header stays readable: the blocks are what the password protects here.
+        sz.set_encrypt_header(false);
+        // Two solid blocks of three files each.
+        for block in 0..2 {
+            let entries: Vec<ArchiveEntry> = (0..3)
+                .map(|i| ArchiveEntry::new_file(&format!("b{block}f{i}.bin")))
+                .collect();
+            let readers: Vec<SourceReader<Cursor<Vec<u8>>>> = (0..3)
+                .map(|i| SourceReader::new(Cursor::new(contents[block * 3 + i].clone())))
+                .collect();
+            sz.push_archive_entries(entries, readers).unwrap();
+        }
+        sz.finish().unwrap();
+    }
+
+    // The blocks as the reader describes them; the password is not needed to copy.
+    let archive = Archive::open_with_password(&source, &Password::empty()).unwrap();
+    assert_eq!(archive.blocks.len(), 2);
+    let dest = temp_dir.path().join("copied.7z");
+    let mut file = std::fs::File::open(&source).unwrap();
+    let mut sz = ArchiveWriter::create(&dest).unwrap();
+    for block_index in 0..archive.blocks.len() {
+        let (offset, sizes) = archive.block_packed_streams(block_index).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let total: u64 = sizes.iter().sum();
+        let mut packed = (&mut file).take(total);
+        let entries: Vec<ArchiveEntry> = archive
+            .block_files(block_index)
+            .into_iter()
+            .map(|i| archive.files[i].clone())
+            .collect();
+        assert_eq!(entries.len(), 3);
+        sz.push_raw_block(&archive.blocks[block_index], sizes, &mut packed, entries)
+            .unwrap();
+    }
+    sz.push_archive_entry(
+        ArchiveEntry::new_file("fresh.txt"),
+        Some(Cursor::new(b"fresh".to_vec())),
+    )
+    .unwrap();
+    sz.finish().unwrap();
+
+    // The copied blocks are the source's bytes, and everything reads back.
+    let source_bytes = std::fs::read(&source).unwrap();
+    let dest_bytes = std::fs::read(&dest).unwrap();
+    for block_index in 0..archive.blocks.len() {
+        let (offset, sizes) = archive.block_packed_streams(block_index).unwrap();
+        let total: usize = sizes.iter().sum::<u64>() as usize;
+        let packed = &source_bytes[offset as usize..offset as usize + total];
+        assert!(
+            dest_bytes.windows(total).any(|w| w == packed),
+            "block {block_index} copied"
+        );
+    }
+    let out = temp_dir.path().join("out");
+    match password {
+        Some(password) => decompress_file_with_password(&dest, &out, Password::new(password)),
+        None => decompress_file(&dest, &out),
+    }
+    .unwrap();
+    for block in 0..2 {
+        for i in 0..3 {
+            let got = std::fs::read(out.join(format!("b{block}f{i}.bin"))).unwrap();
+            assert_eq!(got, contents[block * 3 + i], "b{block}f{i}");
+        }
+    }
+    assert_eq!(std::fs::read(out.join("fresh.txt")).unwrap(), b"fresh");
+    let copied = Archive::open_with_password(&dest, &Password::empty()).unwrap();
+    assert_eq!(copied.blocks.len(), 3);
+    for block_index in 0..2 {
+        let was = &archive.blocks[block_index];
+        let now = &copied.blocks[block_index];
+        assert_eq!(
+            now.coders, was.coders,
+            "block {block_index}: the coders as they were"
+        );
+        assert_eq!(
+            now.graph(),
+            was.graph(),
+            "block {block_index}: the wiring as it was"
+        );
+    }
+}
+
+#[cfg(all(feature = "compress", feature = "aes256"))]
+#[test]
+fn raw_blocks_are_copied_with_their_coders_and_read_back() {
+    raw_block_copy(None);
+}
+
+#[cfg(all(feature = "compress", feature = "aes256"))]
+#[test]
+fn encrypted_raw_blocks_are_copied_without_the_password_and_decrypt_with_it() {
+    raw_block_copy(Some("secret"));
+}

@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option types.
 - The `deflate64` feature decodes the Deflate64 method (id `04 01 09`), which 7-Zip writes with
   `-m0=Deflate64`, through the `deflate64` crate.
+- `ArchiveWriter::push_raw_block` appends a block copied from another archive as it is: its
+  packed bytes unchanged and its coders, properties and wiring as the source header described
+  them, so an update can keep what it keeps without decoding it, an encrypted block without the
+  password. `Archive::block_packed_streams` gives a block's packed bytes' offset and sizes and
+  `Archive::block_files` the files it holds.
 - `prepare_bcj2_block` compresses a solid block behind the BCJ2 filter, as 7-Zip's
   `-mf=BCJ2` does for x86 executables: an encoder of this crate's own splits the code into
   the main, call, jump and decision streams, the first three are compressed with the

@@ -132,7 +132,7 @@ impl UnpackInfo {
 /// and the number of streams it takes (four for BCJ2, one for everything else).
 #[derive(Debug, Clone)]
 pub(crate) struct GraphCoder {
-    pub(crate) id: &'static [u8],
+    pub(crate) id: Vec<u8>,
     pub(crate) properties: Vec<u8>,
     pub(crate) num_in_streams: u64,
 }
@@ -203,7 +203,7 @@ impl BlockInfo {
                         flags |= 0x20;
                     }
                     header.write_u8(flags)?;
-                    header.write_all(coder.id)?;
+                    header.write_all(&coder.id)?;
                     if coder.num_in_streams != 1 {
                         write_u64(header, coder.num_in_streams)?;
                         write_u64(header, 1)?;
