@@ -130,6 +130,110 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         })
     }
 
+    /// Prepares a writer that adds to an archive already in `writer` rather than
+    /// writing a new one.
+    ///
+    /// `archive` is that file's parsed header. The writer takes over its packed
+    /// streams, blocks and entries without reading or re-encoding any of them, so
+    /// adding a member costs that member and a new header rather than the
+    /// archive. Entries pushed afterwards are appended to what is already there,
+    /// and [`finish`](Self::finish) writes the header describing both and patches
+    /// the signature header.
+    ///
+    /// The writer is positioned at the end of the existing packed streams, which
+    /// in a 7z written by this crate is where the old header begins: the packed
+    /// streams are one contiguous run described by a single position, so there is
+    /// nowhere else for new data to go. The old header is therefore overwritten
+    /// as soon as anything is written, and until [`finish`](Self::finish) has
+    /// patched the signature header the file does not open. A caller that cares
+    /// about an interruption has to be able to put the old header back.
+    ///
+    /// The header records a CRC for every file that has a stream, so an archive
+    /// holding a file without one cannot have a header written for it and is
+    /// refused here rather than given a header claiming a CRC it does not have.
+    pub fn append_to(mut writer: W, archive: &Archive) -> Result<Self> {
+        if let Some(entry) = archive
+            .files
+            .iter()
+            .find(|entry| entry.has_stream && !entry.has_crc)
+        {
+            return Err(Error::other(format!(
+                "append_to: {} has no CRC, so a header cannot be written for this archive",
+                entry.name
+            )));
+        }
+
+        let packed: u64 = archive.pack_sizes.iter().sum();
+        let end = SIGNATURE_HEADER_SIZE + archive.pack_pos + packed;
+        writer.seek(std::io::SeekFrom::Start(end))?;
+
+        let mut pack_info = PackInfo {
+            pos: archive.pack_pos,
+            ..Default::default()
+        };
+        for (i, &size) in archive.pack_sizes.iter().enumerate() {
+            // A stream whose CRC the archive did not record keeps a zero, which
+            // is what PackInfo writes as "not defined".
+            let crc = if archive.pack_crcs_defined.contains(i) {
+                archive.pack_crcs.get(i).copied().unwrap_or(0) as u32
+            } else {
+                0
+            };
+            pack_info.add_stream(size, crc);
+        }
+
+        let mut unpack_info = UnpackInfo::default();
+        for (index, block) in archive.blocks.iter().enumerate() {
+            let coders: Vec<GraphCoder> = block
+                .coders
+                .iter()
+                .map(|coder| GraphCoder {
+                    id: coder.encoder_method_id().to_vec(),
+                    properties: coder.properties().to_vec(),
+                    num_in_streams: coder.num_in_streams(),
+                })
+                .collect();
+            let (bind_pairs, packed_streams) = block.graph();
+            let files = archive.block_files(index);
+            let sub_stream_sizes: Vec<u64> = files.iter().map(|&i| archive.files[i].size).collect();
+            let sub_stream_crcs: Vec<u32> = files
+                .iter()
+                .map(|&i| u32::try_from(archive.files[i].crc).unwrap_or(0))
+                .collect();
+            unpack_info.add_multiple(
+                Folder::Graph {
+                    coders,
+                    bind_pairs,
+                    packed_streams,
+                },
+                block.unpack_sizes.clone(),
+                u32::try_from(block.crc).unwrap_or(0),
+                block.num_unpack_sub_streams as u64,
+                sub_stream_sizes,
+                sub_stream_crcs,
+            );
+        }
+
+        Ok(Self {
+            output: writer,
+            files: archive.files.clone(),
+            content_methods: Arc::new(vec![EncoderConfiguration::new(EncoderMethod::LZMA2)]),
+            pack_info,
+            unpack_info,
+            encrypt_header: true,
+        })
+    }
+
+    /// Where the packed streams of the archive this writer is adding to end, which
+    /// is the first byte an append overwrites.
+    ///
+    /// A caller that wants to be able to undo an interrupted append saves the old
+    /// header, which begins here, before writing anything.
+    pub fn append_start(archive: &Archive) -> u64 {
+        let packed: u64 = archive.pack_sizes.iter().sum();
+        SIGNATURE_HEADER_SIZE + archive.pack_pos + packed
+    }
+
     /// Returns a wrapper around `self` that will finish the stream on drop.
     pub fn auto_finish(self) -> AutoFinisher<Self> {
         AutoFinisher(Some(self))
@@ -489,7 +593,19 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     /// Finishes the compression.
-    pub fn finish(mut self) -> std::io::Result<W> {
+    pub fn finish(self) -> std::io::Result<W> {
+        self.finish_with_end().map(|(output, _)| output)
+    }
+
+    /// Finishes the compression and reports where the archive ends.
+    ///
+    /// [`finish`](Self::finish) leaves the writer positioned just past the
+    /// signature header, because patching it is the last thing it does, so the
+    /// position it ends at is not the end of the archive. A caller that appended
+    /// to a file needs the end: an archive that is now shorter than the file it
+    /// sits in has a tail after it, and a reader scanning for a header would find
+    /// the older one there first. Truncate to this.
+    pub fn finish_with_end(mut self) -> std::io::Result<(W, u64)> {
         let mut header: Vec<u8> = Vec::with_capacity(64 * 1024);
         self.write_encoded_header(&mut header)?;
         let header_pos = self.output.stream_position()?;
@@ -514,10 +630,11 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let crc32 = crc32fast::hash(&hh[12..]);
         hh[8..12].copy_from_slice(&crc32.to_le_bytes());
 
+        let end = header_pos + header.len() as u64;
         self.output.seek(std::io::SeekFrom::Start(0))?;
         self.output.write_all(&hh)?;
         self.output.flush()?;
-        Ok(self.output)
+        Ok((self.output, end))
     }
 
     fn write_header<H: Write>(&mut self, header: &mut H) -> std::io::Result<()> {
