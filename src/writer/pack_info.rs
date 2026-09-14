@@ -35,6 +35,15 @@ impl PackInfo {
             let mut temp = Vec::with_capacity(self.len());
             write_bit_set(&mut temp, &crc_define_bits)?;
             header.write_all(&temp)?;
+            // A digests record is the bit vector and then the values of the
+            // streams the vector says are defined. The values were missing, so a
+            // header written down this path ended where a reader expected a CRC,
+            // and no reader would accept it. Nothing reached this path until an
+            // archive whose packed streams carry no CRCs of their own was
+            // appended to.
+            for crc in self.crcs.iter().filter(|crc| **crc != 0) {
+                header.write_u32(*crc)?;
+            }
         }
 
         header.write_u8(K_END)?;
