@@ -151,7 +151,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// The header records a CRC for every file that has a stream, so an archive
     /// holding a file without one cannot have a header written for it and is
     /// refused here rather than given a header claiming a CRC it does not have.
-    pub fn append_to(mut writer: W, archive: &Archive) -> Result<Self> {
+    pub fn append_to(mut writer: W, archive: &Archive) -> Result<Self>
+    where
+        W: Read,
+    {
         if let Some(entry) = archive
             .files
             .iter()
@@ -163,9 +166,22 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             )));
         }
 
+        // New data goes after everything already in the file, which leaves the old
+        // header where it is rather than overwriting it. That is what makes an
+        // interrupted append harmless: until `finish` patches the signature
+        // header, it still points at the old header, and the old header still
+        // describes every member.
+        //
+        // It costs a hole. A 7z's packed streams are one contiguous run described
+        // by a single position, so the bytes between the last existing stream and
+        // the new ones have to be a packed stream too. They are declared as one,
+        // belonging to a block that holds no files, which readers skip.
         let packed: u64 = archive.pack_sizes.iter().sum();
-        let end = SIGNATURE_HEADER_SIZE + archive.pack_pos + packed;
-        writer.seek(std::io::SeekFrom::Start(end))?;
+        let streams_end = SIGNATURE_HEADER_SIZE + archive.pack_pos + packed;
+        let end = writer.seek(std::io::SeekFrom::End(0))?;
+        let hole = end.checked_sub(streams_end).ok_or_else(|| {
+            Error::other("append_to: the file ends before its own packed streams do")
+        })?;
 
         let mut pack_info = PackInfo {
             pos: archive.pack_pos,
@@ -214,6 +230,48 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             );
         }
 
+        // The hole, declared so the streams stay contiguous. It holds no files, so
+        // nothing ever decodes it, but its CRC is recorded like any other
+        // stream's: PackInfo's "not all defined" branch writes the bit set and
+        // then neither the External byte nor the CRCs themselves, so an undefined
+        // CRC produces a header no reader accepts. The bytes are the old header
+        // and there are few of them, so this costs one short read.
+        if hole > 0 {
+            writer.seek(std::io::SeekFrom::Start(streams_end))?;
+            let mut hasher = crc32fast::Hasher::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut left = hole;
+            while left > 0 {
+                let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+                let n = writer.read(&mut buf[..want])?;
+                if n == 0 {
+                    return Err(Error::other(
+                        "append_to: the file ends inside its own header",
+                    ));
+                }
+                hasher.update(&buf[..n]);
+                left -= n as u64;
+            }
+            writer.seek(std::io::SeekFrom::Start(end))?;
+            pack_info.add_stream(hole, hasher.finalize());
+            unpack_info.add_multiple(
+                Folder::Graph {
+                    coders: vec![GraphCoder {
+                        id: EncoderMethod::ID_COPY.to_vec(),
+                        properties: Vec::new(),
+                        num_in_streams: 1,
+                    }],
+                    bind_pairs: Vec::new(),
+                    packed_streams: Vec::new(),
+                },
+                vec![hole],
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+
         Ok(Self {
             output: writer,
             files: archive.files.clone(),
@@ -224,12 +282,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         })
     }
 
-    /// Where the packed streams of the archive this writer is adding to end, which
-    /// is the first byte an append overwrites.
-    ///
-    /// A caller that wants to be able to undo an interrupted append saves the old
-    /// header, which begins here, before writing anything.
-    pub fn append_start(archive: &Archive) -> u64 {
+    /// Where the packed streams of the archive end, which is where its header
+    /// begins and where the hole an append declares starts.
+    pub fn packed_end(archive: &Archive) -> u64 {
         let packed: u64 = archive.pack_sizes.iter().sum();
         SIGNATURE_HEADER_SIZE + archive.pack_pos + packed
     }

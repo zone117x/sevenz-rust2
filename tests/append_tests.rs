@@ -5,7 +5,7 @@
 //! afterwards as one whole, and the entries that were already in it come back
 //! with the same contents and the same CRCs.
 
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read};
 
 use sevenz_rust2::{ArchiveEntry, ArchiveReader, ArchiveWriter, Password};
 
@@ -111,7 +111,7 @@ fn the_packed_bytes_that_were_there_do_not_move() {
     // archive. The signature header itself is expected to change, since it is
     // what points at the new header.
     const SIGNATURE: usize = 32;
-    let start = ArchiveWriter::<Cursor<Vec<u8>>>::append_start(&archive) as usize;
+    let start = ArchiveWriter::<Cursor<Vec<u8>>>::packed_end(&archive) as usize;
     let packed_before = bytes[SIGNATURE..start].to_vec();
 
     append(&mut bytes, vec![("added.txt", b"appended\n".to_vec())]);
@@ -159,39 +159,33 @@ fn appending_again_and_again_keeps_every_member_readable() {
 }
 
 #[test]
-fn an_append_can_be_undone_while_it_is_in_flight() {
-    // An append overwrites the old header as soon as it writes anything, so a
-    // caller that wants to survive an interruption saves the bytes from
-    // `append_start` to the end of the file first. Putting them back, and the
-    // length with them, restores the archive exactly, because the signature
-    // header is patched last and still points at the old header until then.
-    let bytes = three_members();
-    let was = contents(&bytes);
-    let archive = {
-        let reader = ArchiveReader::new(Cursor::new(&bytes[..]), Password::empty()).unwrap();
-        reader.archive().clone()
-    };
-    let start = ArchiveWriter::<Cursor<Vec<u8>>>::append_start(&archive) as usize;
-    let saved = bytes[start..].to_vec();
+fn an_interrupted_append_leaves_the_archive_as_it_was() {
+    // New data goes after everything already in the file, so the old header is
+    // still there and the signature header still points at it. A file cut
+    // anywhere in the new tail therefore reads exactly as it did before, with no
+    // recovery step at all.
+    const SIGNATURE: usize = 32;
+    let original = three_members();
+    let was = contents(&original);
+    let mut bytes = original.clone();
 
-    // An append that got as far as writing some data and then stopped.
-    let mut interrupted = bytes.clone();
-    {
-        let mut cursor = Cursor::new(&mut interrupted);
-        cursor.seek(SeekFrom::Start(start as u64)).unwrap();
-        cursor.write_all(&[0xAB; 512]).unwrap();
+    append(&mut bytes, vec![("late.txt", b"written last\n".to_vec())]);
+
+    let tail = bytes.len() - original.len();
+    assert!(tail > 0, "the append wrote nothing to cut");
+    for cut in 0..tail {
+        // What an interruption actually leaves: some of the new tail written, and
+        // the signature header still the one that was there, because patching it
+        // is the last thing an append does. Truncating the finished file instead
+        // would be testing corruption, not interruption.
+        let mut partial = bytes[..original.len() + cut].to_vec();
+        partial[..SIGNATURE].copy_from_slice(&original[..SIGNATURE]);
+        assert_eq!(
+            contents_or_none(&partial).as_ref(),
+            Some(&was),
+            "a file cut {cut} bytes into the append did not read as it did before"
+        );
     }
-    assert!(
-        ArchiveReader::new(Cursor::new(&interrupted[..]), Password::empty()).is_err()
-            || contents_or_none(&interrupted).is_none(),
-        "an interrupted append should not read as a whole archive"
-    );
-
-    // The recovery: the saved bytes back where they were, and the old length.
-    interrupted.truncate(start);
-    interrupted.extend_from_slice(&saved);
-    assert_eq!(interrupted, bytes, "the file is not what it was");
-    assert_eq!(contents(&interrupted), was);
 }
 
 /// The archive's contents, or nothing if it will not read.
